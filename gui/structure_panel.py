@@ -444,9 +444,19 @@ class StructurePanel(QWidget):
                 continue
 
             active_sublattices.append(
-                {"sites": sorted(sites), "composition": comp}
+                {
+                    "sites": sorted(sites),
+                    "composition": comp,
+                    "group_label": row.group_label,
+                }
             )
             for z, cnt in comp.items():
                 merged_comp[z] = merged_comp.get(z, 0) + cnt
 
         return active_sublattices, merged_comp
+
+    def get_primitive(self) -> Optional[Structure]:
+        return self._primitive
+
+    def get_supercell_dims(self) -> Tuple[int, int, int]:
+        return (self._sa.value(), self._sb.value(), self._sc.value())

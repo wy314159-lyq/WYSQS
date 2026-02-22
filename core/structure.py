@@ -1,7 +1,6 @@
 # core/structure.py
 # Structure dataclass, distance matrix (PBC), shell detection, shell matrix,
-# pairs list, prefactors, supercell expansion.
-# All algorithms match sqsgenerator C++ source exactly.
+# pairs list, prefactors, and supercell expansion utilities.
 
 from __future__ import annotations
 
@@ -526,50 +525,79 @@ def compute_prefactors_sublattice(
 
 
 # ---------------------------------------------------------------------------
-# Supercell expansion
+# Supercell expansion + HNF shape candidates
 # ---------------------------------------------------------------------------
 
-def make_supercell(structure: Structure, sa: int, sb: int, sc: int) -> Structure:
+def _validate_hnf(hnf: np.ndarray) -> np.ndarray:
     """
-    Expand structure into a sa × sb × sc supercell.
+    Validate and normalize a 3x3 integer HNF matrix.
 
-    Algorithm (matches core/structure.h structure::supercell):
-      new_lattice = lattice @ diag([sa, sb, sc])
-      iscale = diag([1/sa, 1/sb, 1/sc])
-      scaled_frac = frac_coords @ iscale          # coords in supercell frame
-      for i in range(sa), j in range(sb), k in range(sc):
-          translation = [i/sa, j/sb, k/sc]
-          append scaled_frac + translation
-
-    All fractional coordinates remain in [0, 1).
+    We use lower-triangular HNF with positive diagonal:
+      [[h11, 0,   0  ],
+       [h21, h22, 0  ],
+       [h31, h32, h33]]
     """
-    if sa < 1 or sb < 1 or sc < 1:
-        raise ValueError("Supercell dimensions must be >= 1")
+    h = np.asarray(hnf, dtype=np.int64)
+    if h.shape != (3, 3):
+        raise ValueError("HNF matrix must have shape (3, 3).")
 
-    scale = np.diag([float(sa), float(sb), float(sc)])
-    new_lattice = structure.lattice @ scale
+    if h[0, 0] <= 0 or h[1, 1] <= 0 or h[2, 2] <= 0:
+        raise ValueError("HNF diagonal entries must be positive.")
+    if h[0, 1] != 0 or h[0, 2] != 0 or h[1, 2] != 0:
+        raise ValueError("HNF must be lower triangular.")
+    if h[1, 0] < 0 or h[1, 0] >= h[0, 0]:
+        raise ValueError("HNF constraint violated: 0 <= h21 < h11.")
+    if h[2, 0] < 0 or h[2, 0] >= h[0, 0]:
+        raise ValueError("HNF constraint violated: 0 <= h31 < h11.")
+    if h[2, 1] < 0 or h[2, 1] >= h[1, 1]:
+        raise ValueError("HNF constraint violated: 0 <= h32 < h22.")
 
-    iscale = np.diag([1.0 / sa, 1.0 / sb, 1.0 / sc])
-    scaled_frac = structure.frac_coords @ iscale   # (N, 3)
+    return h
 
-    new_coords_list = []
+
+def make_supercell_hnf(structure: Structure, hnf: np.ndarray) -> Structure:
+    """
+    Expand a structure with an integer HNF transform matrix.
+
+    Fractional/cartesian convention used here:
+      cart = frac @ lattice
+      lattice vectors are stored as rows.
+
+    For a supercell transform matrix H:
+      lattice' = H @ lattice
+      frac' = frac @ H^{-1} + t
+    where t spans coset representatives of Z^3 / H Z^3.
+    """
+    h = _validate_hnf(hnf)
+    volume = int(round(abs(np.linalg.det(h))))
+    if volume <= 0:
+        raise ValueError("HNF determinant must be positive.")
+
+    h_inv = np.linalg.inv(h.astype(np.float64))
+    new_lattice = h.astype(np.float64) @ structure.lattice
+    scaled_frac = structure.frac_coords @ h_inv
+
+    h11 = int(h[0, 0])
+    h22 = int(h[1, 1])
+    h33 = int(h[2, 2])
+
+    new_coords_list: List[np.ndarray] = []
     new_species: List[int] = []
     new_labels: List[str] = []
     new_groups: List[str] = []
 
-    for i in range(sa):
-        for j in range(sb):
-            for k in range(sc):
-                t = np.array([i / sa, j / sb, k / sc], dtype=np.float64)
+    # For lower-triangular HNF these ranges generate exactly det(H) images.
+    for i in range(h11):
+        for j in range(h22):
+            for k in range(h33):
+                n = np.array([float(i), float(j), float(k)], dtype=np.float64)
+                t = n @ h_inv
                 new_coords_list.append(scaled_frac + t)
                 new_species.extend(structure.species)
                 new_labels.extend(structure.site_labels)
                 new_groups.extend(structure.site_groups)
 
-    new_frac = np.vstack(new_coords_list)
-    # Wrap to [0, 1) to avoid floating-point drift
-    new_frac = new_frac % 1.0
-
+    new_frac = np.vstack(new_coords_list) % 1.0
     return Structure(
         lattice=new_lattice,
         frac_coords=new_frac,
@@ -578,3 +606,93 @@ def make_supercell(structure: Structure, sa: int, sb: int, sc: int) -> Structure
         site_groups=new_groups,
         pbc=structure.pbc,
     )
+
+
+def make_supercell(structure: Structure, sa: int, sb: int, sc: int) -> Structure:
+    """Expand structure into a diagonal supercell sa x sb x sc."""
+    if sa < 1 or sb < 1 or sc < 1:
+        raise ValueError("Supercell dimensions must be >= 1")
+    h = np.array([[sa, 0, 0], [0, sb, 0], [0, 0, sc]], dtype=np.int64)
+    return make_supercell_hnf(structure, h)
+
+
+def _factor_triples(volume: int) -> List[Tuple[int, int, int]]:
+    """Return all positive triples (a, b, c) with a*b*c == volume."""
+    triples: List[Tuple[int, int, int]] = []
+    for a in range(1, volume + 1):
+        if volume % a != 0:
+            continue
+        rem = volume // a
+        for b in range(1, rem + 1):
+            if rem % b != 0:
+                continue
+            triples.append((a, b, rem // b))
+    return triples
+
+
+def enumerate_hnf_matrices(volume: int) -> List[np.ndarray]:
+    """Enumerate all lower-triangular HNF matrices with determinant=volume."""
+    if volume < 1:
+        raise ValueError("volume must be >= 1")
+
+    hnfs: List[np.ndarray] = []
+    for h11, h22, h33 in _factor_triples(volume):
+        for h21 in range(h11):
+            for h31 in range(h11):
+                for h32 in range(h22):
+                    hnfs.append(
+                        np.array(
+                            [[h11, 0, 0], [h21, h22, 0], [h31, h32, h33]],
+                            dtype=np.int64,
+                        )
+                    )
+    return hnfs
+
+
+def hnf_shape_score(lattice: np.ndarray, hnf: np.ndarray) -> float:
+    """
+    Lower is better. Penalizes anisotropy and non-orthogonality.
+    """
+    new_lattice = np.asarray(hnf, dtype=np.float64) @ np.asarray(lattice, dtype=np.float64)
+    a, b, c = new_lattice[0], new_lattice[1], new_lattice[2]
+    la = float(np.linalg.norm(a))
+    lb = float(np.linalg.norm(b))
+    lc = float(np.linalg.norm(c))
+    lengths = np.array([la, lb, lc], dtype=np.float64)
+    if np.any(lengths <= 0.0):
+        return float("inf")
+
+    lgeo = float(np.exp(np.mean(np.log(lengths))))
+    anis = float(np.mean(np.abs(np.log(lengths / lgeo))))
+
+    cos_ab = float(np.dot(a, b) / (la * lb))
+    cos_ac = float(np.dot(a, c) / (la * lc))
+    cos_bc = float(np.dot(b, c) / (lb * lc))
+    ortho = (abs(cos_ab) + abs(cos_ac) + abs(cos_bc)) / 3.0
+    return anis + 0.35 * ortho
+
+
+def rank_hnf_candidates(
+    structure: Structure,
+    volume: int,
+    max_candidates: int = 24,
+    include_diagonal: Optional[Tuple[int, int, int]] = None,
+) -> List[np.ndarray]:
+    """Enumerate and rank HNF candidates for a fixed supercell volume."""
+    hnfs = enumerate_hnf_matrices(volume)
+    if include_diagonal is not None:
+        sa, sb, sc = include_diagonal
+        hnfs.append(np.array([[sa, 0, 0], [0, sb, 0], [0, 0, sc]], dtype=np.int64))
+
+    uniq: Dict[Tuple[int, ...], np.ndarray] = {}
+    for h in hnfs:
+        uniq[tuple(int(v) for v in h.ravel())] = h
+
+    scored = [
+        (hnf_shape_score(structure.lattice, h), key, h)
+        for key, h in uniq.items()
+    ]
+    scored.sort(key=lambda x: (x[0], x[1]))
+
+    keep = max(1, int(max_candidates))
+    return [item[2] for item in scored[:keep]]

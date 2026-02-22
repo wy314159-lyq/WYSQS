@@ -1,312 +1,340 @@
-# SQS GUI 技术文档（已校核）
+# SQS GUI 技术文档
 
-> 本文档已按当前代码实现重新校核，重点修正了“底层数学原理、默认参数、子晶格约束和迭代策略”的描述。
+## 1. 文档范围
 
----
+本文档定义本程序在 SQS（Special Quasirandom Structure）构建中的数学模型、算法流程、参数语义与推荐配置。  
+实现范围包括：
 
-## 1. 项目定位
-
-`sqs_gui` 是一个纯 Python 的 SQS（Special Quasirandom Structure）构型搜索工具，带 PyQt5 图形界面。
-
-核心目标：在给定超胞与子晶格组成约束下，搜索使 Warren-Cowley 短程有序参数接近目标值（默认 0）的构型。
-
----
-
-## 2. 当前实现与参考程序的一致性边界
-
-本实现在以下层面与 `sqsgenerator` 的核心数学定义保持一致：
-
-1. **Warren-Cowley SRO 定义**（含非对角对称化计数）
-2. **预因子** \(f_{\xi\eta}^{(s)} = (N M^{(s)} x_\xi x_\eta)^{-1}\)
-3. **目标函数**按壳层与元素对的加权绝对偏差求和（上三角防重复计数）
-4. **默认权重逻辑**：
-   - 壳层权重默认 \(w_s=1/s\)
-   - 元素对默认权重为“空心矩阵”（对角 0，非对角 1）
-5. **子晶格内置换**：随机模式对每个活性子晶格独立洗牌
+1. 二体 Warren-Cowley 短程有序参数目标；
+2. 可选三体相关项；
+3. 搜索算法（随机洗牌、系统枚举、模拟退火）；
+4. 固定体积 HNF 超胞形状优化；
+5. 子晶格组分与冻结位点约束；
+6. 并行执行与结果一致性规则。
 
 ---
 
-## 3. 核心数据结构
+## 2. 公式渲染规范
 
-### 3.1 `Structure`（`core/structure.py`）
+本文档使用标准 Markdown 数学语法：
 
-```python
-@dataclass
-class Structure:
-    lattice: np.ndarray      # (3,3), 行向量为晶格矢量
-    frac_coords: np.ndarray  # (N,3), 分数坐标
-    species: List[int]       # 原子序数
-    site_labels: List[str]
-    pbc: Tuple[bool,bool,bool] = (True, True, True)
-```
+- 行内公式：`\(...\)`
+- 块级公式：`$$...$$`
 
-基本变换：
-\[
-\mathbf{r}_i^{\text{cart}} = \mathbf{s}_i \mathbf{L}
-\]
+若预览器不支持 MathJax/KaTeX，公式将以源文本显示。
 
-### 3.2 `Sublattice`（`core/sqs.py`）
+---
 
-```python
-@dataclass
-class Sublattice:
-    sites: List[int]            # 子晶格位点索引
-    composition: Dict[int, int] # {Z: count}
-```
+## 3. 记号定义
 
-约束：
-- `sites` 非空、无重复、无越界
-- 各子晶格位点不允许重叠
-- `sum(composition.values()) == len(sites)`
-
-### 3.3 `OptimizationConfig`（`core/sqs.py`）
-
-```python
-@dataclass
-class OptimizationConfig:
-    structure: Structure
-    sublattices: List[Sublattice]
-    shell_weights: Dict[int, float]
-    pair_weights: Optional[np.ndarray] = None   # shape (S,K,K)
-    target: Optional[np.ndarray] = None         # shape (S,K,K)
-    shell_radii: Optional[List[float]] = None
-    iterations: int = 100_000
-    keep: int = 10
-    atol: float = 1e-3
-    rtol: float = 1e-5
-    bin_width: float = 0.05
-    peak_isolation: float = 0.25
-    iteration_mode: str = "random"            # "random" or "systematic"
-    seed: Optional[int] = None
-```
-
-### 3.4 `SQSResult`（`core/sqs.py`）
-
-```python
-@dataclass
-class SQSResult:
-    objective: float
-    species: List[int]
-    sro: np.ndarray
-    unique_z: List[int]
-    shell_radii: List[float]
-    iteration: int
-```
-
-### 3.5 `SQSQuality`（`core/quality.py`）
-
-用于科研判据的质量评分：
-- `grade`（A+~E/F）
-- `score`（0~100）
-- `wmae, wrmse, p95, max_delta, shell1_wmae`
-- `hard_failures`（硬约束失败项）
+- \(N\)：总原子数  
+- \(s\)：壳层索引  
+- \(\xi,\eta\)：元素（物种）索引  
+- \(M^{(s)}\)：第 \(s\) 壳层平均配位数  
+- \(x_\xi\)：元素 \(\xi\) 浓度  
+- \(\tilde{\alpha}_{\xi\eta}^{(s)}\)：目标相关函数（默认 0）  
+- \(w_s\)：壳层权重  
+- \(w_{\xi\eta}^{(s)}\)：元素对权重  
+- \(O_{\mathrm{pair}}\)：二体目标  
+- \(O_{\mathrm{triplet}}\)：三体目标  
+- \(\lambda_{\mathrm{triplet}}\)：三体系数（`triplet_weight`）
 
 ---
 
 ## 4. 底层数学原理
 
-### 4.1 Warren-Cowley SRO
+### 4.1 二体 Warren-Cowley SRO
 
-多元、多壳层形式：
-\[
-\alpha_{\xi\eta}^{(s)} = 1 - f_{\xi\eta}^{(s)} N_{\xi\eta,\text{eff}}^{(s)}
-\]
+对壳层 \(s\) 与元素对 \((\xi,\eta)\)，定义
 
-其中：
-\[
-f_{\xi\eta}^{(s)} = \frac{1}{N M^{(s)} x_\xi x_\eta}
-\]
+$$
+\alpha_{\xi\eta}^{(s)}
+=
+1
+-
+f_{\xi\eta}^{(s)}
+N_{\xi\eta,\mathrm{eff}}^{(s)}
+$$
 
-- \(N\)：总原子数
-- \(M^{(s)}\)：第 \(s\) 壳层每原子平均邻居数
-- \(x_\xi\)：元素 \(\xi\) 浓度
+其中
 
-非对角元素对使用对称化计数：
-\[
-N_{\xi\eta,\text{eff}}^{(s)} =
+$$
+f_{\xi\eta}^{(s)}
+=
+\frac{1}{N\,M^{(s)}\,x_\xi\,x_\eta}
+$$
+
+非对角计数采用对称化：
+
+$$
+N_{\xi\eta,\mathrm{eff}}^{(s)}
+=
 \begin{cases}
-N_{\xi\xi}^{(s)}, & \xi=\eta \\
-N_{\xi\eta}^{(s)} + N_{\eta\xi}^{(s)}, & \xi\neq\eta
+N_{\xi\xi}^{(s)}, & \xi=\eta\\
+N_{\xi\eta}^{(s)}+N_{\eta\xi}^{(s)}, & \xi\neq\eta
 \end{cases}
-\]
-
-> 这与参考程序的 `compute_objective` 对角/非对角处理一致。
-
-### 4.2 预因子与壳层配位数
-
-壳层配位数由壳层矩阵统计：
-\[
-M^{(s)} = \frac{\#\{(i,j):\, \text{shell}(i,j)=s\}}{N}
-\]
-
-预因子对 \((\xi,\eta)\) 对称赋值。
-
-### 4.3 目标函数
-
-\[
-\mathcal{O}(\sigma) = \sum_{s}\sum_{\xi\le\eta}
-\tilde{p}_{\xi\eta}^{(s)}
-\left|\alpha_{\xi\eta}^{(s)}(\sigma)-\tilde{\alpha}_{\xi\eta}^{(s)}\right|
-\]
-
-- \(\tilde{\alpha}_{\xi\eta}^{(s)}\)：目标 SRO（默认 0）
-- \(\tilde{p}_{\xi\eta}^{(s)}\)：最终权重
-
-实现中：
-1. 先构造元素对权重 \(p_{\xi\eta}\)（默认空心矩阵）
-2. 再按壳层缩放：\(\tilde{p}_{\xi\eta}^{(s)} = w_s\, p_{\xi\eta}\)
-3. 仅统计上三角 \((\xi\le\eta)\) 避免重复计数
+$$
 
 ---
 
-## 5. 几何与壳层识别
+### 4.2 壳层配位数与预因子
 
-### 5.1 周期边界最小镜像距离
+壳层配位数按壳层矩阵统计：
 
-对每个原子对遍历 \(\{-1,0,1\}^3\) 共 27 个平移像，取最短距离：
-\[
-d_{ij}=\min_{u,v,w\in\{-1,0,1\}}\left\|\mathbf{r}_i-(u\mathbf{a}+v\mathbf{b}+w\mathbf{c}+\mathbf{r}_j)\right\|
-\]
+$$
+M^{(s)}
+=
+\frac{\#\{(i,j)\mid \mathrm{shell}(i,j)=s\}}{N}
+$$
 
-- 小体系全向量化
-- 大体系分块（避免峰值内存过高）
+浓度定义：
 
-### 5.2 壳层检测策略
+$$
+x_\xi=\frac{N_\xi}{N}
+$$
 
-当前实现支持两种方法：
-
-1. **Histogram-peak（默认优先）**
-   - 使用 `bin_width` 与 `peak_isolation` 找壳层峰
-2. **Naive（回退）**
-   - 排序 + 容差合并
-
-GUI 的 `Re-detect` 与优化器都采用“**先 histogram，失败回退 naive**”策略。
-
-### 5.3 壳层矩阵与原子对
-
-- `build_shell_matrix`：将每个 \(d_{ij}\) 映射到壳层编号
-- `build_pairs`：只保留 `shell_weights` 中激活壳层、且 `i<j` 的原子对
+该归一化使不同组分与超胞尺寸下目标量具有可比性。
 
 ---
 
-## 6. 优化算法
+### 4.3 二体目标函数
 
-### 6.1 子晶格约束与“只在指定位点替换”
+$$
+O_{\mathrm{pair}}
+=
+\sum_s
+\sum_{\xi\le\eta}
+w_{\xi\eta}^{(s)}
+\left|
+\alpha_{\xi\eta}^{(s)}-\tilde{\alpha}_{\xi\eta}^{(s)}
+\right|
+$$
 
-GUI 中每个“元素行”可定义替换组成。若某行仍保持“全原元素”，该行会被视为**冻结**，不进入活性子晶格。
+默认设置：
 
-因此：
-- 若 AB 结构只编辑 B 行，则只会在 B 位替换；A 位保持不动。
-
-### 6.2 随机模式（`iteration_mode="random"`）
-
-每次迭代：
-1. 对每个活性子晶格独立 `rng.shuffle`
-2. 写回全结构物种
-3. `bincount` 统计壳层-元素对键计数
-4. 计算 SRO 与目标函数
-5. 若目标值优于阈值则保留
-
-### 6.3 系统模式（`iteration_mode="systematic"`）
-
-- 当前仅支持 **一个** 活性子晶格
-- 用 `next_permutation` 按字典序枚举多重集排列
-- 迭代上限为：
-\[
-\frac{n!}{\prod_i c_i!}
-\]
-其中 \(n\) 为该子晶格位点数，\(c_i\) 为各元素计数
-
-### 6.4 结果筛选
-
-- 保留候选上限约为 `keep * 20`
-- 排序键：`(objective, secondary_score)`
-- 二次分数为非对角 SRO 绝对值之和（用于同 objective 时细分）
-- 最终按物种排列去重
+1. \(\tilde{\alpha}_{\xi\eta}^{(s)}=0\)；
+2. 元素对权重为空心矩阵（对角 0，非对角 1）；
+3. 再乘壳层权重 \(w_s\)。
 
 ---
 
-## 7. 科研打分与评级（`core/quality.py`）
+### 4.4 三体相关项
 
-评分只针对 SRO 偏差，不替代最终 DFT 验证。
+三体项以“壳层签名分类 + 分布偏差”定义：
 
-### 7.1 指标定义（默认按非对角对）
+1. 构造三元组 \((i,j,k)\)，满足 \(i<j<k\) 且三条边均落在激活壳层；
+2. 按三条边的壳层签名分组为类型 \(t\)；
+3. 统计每类型中排序三元元素组合 \(c\) 的观测频率 \(p_{t,c}^{\mathrm{obs}}\)；
+4. 与随机混合概率 \(p_{c}^{\mathrm{rand}}\) 比较。
 
-令
-\[
-\Delta_{\xi\eta}^{(s)} = \left|\alpha_{\xi\eta}^{(s)}-\tilde{\alpha}_{\xi\eta}^{(s)}\right|
-\]
+三体目标：
 
-- `wMAE`：按壳层权重的加权平均绝对偏差
-- `wRMSE`：按壳层权重的加权均方根偏差
-- `P95`：\(\Delta\) 的 95% 分位数
-- `max_delta`：\(\max\Delta\)
-- `shell1_wMAE`：第一壳层偏差均值
-
-### 7.2 等级阈值（内置）
-
-- A+：`wRMSE<=0.020` 且 `P95<=0.040` 且 `max<=0.080` 且 `shell1<=0.030`
-- A：`wRMSE<=0.035` 且 `P95<=0.070` 且 `max<=0.150` 且 `shell1<=0.050`
-- B：`wRMSE<=0.060` 且 `P95<=0.120` 且 `max<=0.250` 且 `shell1<=0.080`
-- C：`wRMSE<=0.100` 且 `P95<=0.200` 且 `max<=0.350` 且 `shell1<=0.120`
-- D：`wRMSE<=0.150` 且 `P95<=0.300` 且 `max<=0.500`
-- 否则 E
-
-### 7.3 硬失败（直接 F）
-
-若提供了基结构与子晶格定义，则以下任一触发 F：
-1. 任一子晶格的结果组成与约束不一致
-2. 冻结位点发生物种变化
+$$
+O_{\mathrm{triplet}}
+=
+\sum_t \omega_t
+\sum_c
+\left|
+p_{t,c}^{\mathrm{obs}}-p_c^{\mathrm{rand}}
+\right|
+$$
 
 ---
 
-## 8. GUI 关键行为
+### 4.5 总目标函数
 
-### 8.1 参数面板默认值（已校正）
+$$
+O_{\mathrm{total}}
+=
+O_{\mathrm{pair}}
++
+\lambda_{\mathrm{triplet}}\,O_{\mathrm{triplet}}
+$$
 
-- 壳层权重：默认 \(w_s=1/s\)
-- 元素对权重：默认对角 0、非对角 1
-- 壳层识别：默认 histogram，失败回退 naive
+其中
 
-### 8.2 结果面板
+$$
+\lambda_{\mathrm{triplet}}=\texttt{triplet\_weight}
+$$
 
-每条结果会显示：
-- `grade / score`
-- `objective`
-- 迭代步
-
-并在详情区显示：`wRMSE, wMAE, P95, max, shell1-wMAE` 与硬失败信息。
-
----
-
-## 9. 数据流（简版）
-
-```text
-结构文件 -> Structure -> Supercell
-         -> shell detection -> shell matrix -> active pairs
-         -> prefactors / weights / target
-         -> random 或 systematic 搜索
-         -> 去重候选结果
-         -> 质量评分 + GUI 展示 + 导出
-```
+特殊情形：\(\lambda_{\mathrm{triplet}}=0\) 时，目标退化为纯二体 SQS。
 
 ---
 
-## 10. 研究使用建议
+### 4.6 模拟退火接受准则
 
-1. 先确保硬约束通过（无 F）
-2. 主要看 `wRMSE + shell1-wMAE`，其次看 `P95/max`
-3. 多个 seed 重复验证稳定性
-4. 最终以 DFT/性质波动做物理判据
+设交换提案引起目标变化 \(\Delta O\)，温度为 \(T\)，接受概率：
+
+$$
+P_{\mathrm{accept}}
+=
+\begin{cases}
+1, & \Delta O\le 0\\
+\exp(-\Delta O/T), & \Delta O>0
+\end{cases}
+$$
+
+温度由 `anneal_start_temp` 逐步降至 `anneal_end_temp`。
 
 ---
 
-## 11. 本次文档修正要点（相对旧版）
+### 4.7 HNF 超胞形状优化
 
-- 将过时的 `sublattice_sites + composition` 模型更新为 `sublattices`
-- 修正默认 `pair_weights`：由“全 1”改为“空心矩阵”
-- 修正默认壳层检测：由“仅 naive”改为“histogram 优先 + naive 回退”
-- 补充 `systematic` 枚举模式与多重集排列上限
-- 明确“只在活性子晶格置换”的约束语义
-- 增加质量评分体系与硬失败判据
+在固定体积 \(V\) 下，枚举 HNF：
+
+$$
+H=
+\begin{bmatrix}
+h_{11}&0&0\\
+h_{21}&h_{22}&0\\
+h_{31}&h_{32}&h_{33}
+\end{bmatrix},
+\quad
+\det(H)=V
+$$
+
+超胞变换：
+
+$$
+L'=H\,L,\qquad
+f'=fH^{-1}+t
+$$
+
+其中 \(L\) 为晶格矩阵，\(f\) 为分数坐标，\(t\) 为 coset 平移。  
+每个候选形状独立求解后进行全局筛选。
+
+---
+
+## 5. 约束与正确性规则
+
+### 5.1 子晶格约束
+
+- 仅 `Sublattice.sites` 内位点允许替换；
+- `composition` 必须与活性位点数严格一致；
+- 不同子晶格位点不允许重叠。
+
+### 5.2 冻结位点
+
+未进入活性子晶格的位点在搜索过程中保持不变。
+
+### 5.3 形状优化下的位点映射
+
+使用 `group_label` 将原结构子晶格映射到新 HNF 超胞，保证“指定子晶格替换”语义保持一致。
+
+---
+
+## 6. 参数说明与推荐配置
+
+### 6.1 结构与子晶格参数
+
+| 参数 | 含义 | 影响 | 推荐 |
+|---|---|---|---|
+| `supercell_dims=(sa,sb,sc)` | 对角超胞复制倍数 | 维度越大，统计自由度更高，计算量增大 | 初始 2x2x2 或同量级 |
+| `sublattices[].sites` | 活性替换位点 | 决定替换发生位置 | 单子晶格固溶体应覆盖该子晶格全部等价位 |
+| `sublattices[].composition` | 活性位点组分约束 | 严格守恒 | 总数必须等于活性位点数 |
+| `sublattices[].group_label` | 形状优化映射标签 | 决定形状优化后的子晶格一致性 | 开启 shape optimization 时必须正确设置 |
+
+### 6.2 二体目标参数
+
+| 参数 | 含义 | 影响 | 推荐 |
+|---|---|---|---|
+| `shell_weights` | 壳层权重 \(w_s\) | 决定各壳层贡献 | 默认可用 \(1/s\) |
+| `pair_weights` | 元素对权重 | 强化/弱化特定元素对 | 默认空心矩阵通常足够 |
+| `target` | 目标 SRO 张量 | 定义拟合目标 | 随机固溶体用 0 |
+| `shell_radii` | 手工壳层半径 | 控制壳层划分 | 优先自动识别；异常时手工设置 |
+| `atol`,`rtol` | 壳层比较容差 | 影响壳层归类稳定性 | 先使用默认 |
+| `bin_width`,`peak_isolation` | 直方图识壳参数 | 影响自动壳层分辨率 | 先使用默认 |
+
+### 6.3 搜索参数
+
+| 参数 | 含义 | 影响 | 推荐 |
+|---|---|---|---|
+| `search_mode` | 搜索模式 | 速度/质量/可扩展性 | 优先 `anneal` |
+| `iterations` | 总迭代预算 | 预算越高，最优值通常越低 | 先中等预算，后续递增 |
+| `keep` | 保留结果数 | 增加结果多样性 | 10~30 常用 |
+| `seed` | 随机种子 | 决定可复现性 | 报告中固定并记录 |
+
+### 6.4 退火参数
+
+| 参数 | 含义 | 影响 | 推荐 |
+|---|---|---|---|
+| `anneal_start_temp` | 初始温度 | 越高探索越强 | 0.1~0.5 起步 |
+| `anneal_end_temp` | 末端温度 | 越低收敛越强 | \(10^{-3}\)~\(10^{-4}\) |
+| `anneal_greedy_passes` | 末端贪心精修轮数 | 提升局部收敛，增加少量开销 | 1~3 |
+
+### 6.5 三体参数
+
+| 参数 | 含义 | 影响 | 推荐 |
+|---|---|---|---|
+| `triplet_weight` | 三体系数 \(\lambda_{\mathrm{triplet}}\) | 越大越重视高阶相关，计算更慢 | 快速筛选 0；平衡 0.1~0.3；高精度 0.3~0.5 |
+
+### 6.6 形状优化参数
+
+| 参数 | 含义 | 影响 | 推荐 |
+|---|---|---|---|
+| `enable_shape_optimization` | 启用 HNF 外层搜索 | 提升最优结构概率，增加耗时 | 调参阶段可关；最终可开 |
+| `supercell_volume` | HNF 体积 \(\det(H)\) | 决定候选空间规模 | 与目标超胞体积一致 |
+| `max_shape_candidates` | 参与优化的形状数 | 近似线性增加计算成本 | 8~24 起步 |
+
+### 6.7 并行参数
+
+| 参数 | 含义 | 影响 | 推荐 |
+|---|---|---|---|
+| `num_threads` | 候选级并行线程数 | 受候选数上限约束 | `0`（Auto）或接近物理核心数 |
+
+并行一致性规则：
+
+1. 并行不改变目标函数定义；
+2. 固定 `seed` 时使用确定性子种子分配候选任务；
+3. 候选数量不足时 CPU 利用率不会满载，属并行粒度特性。
+
+---
+
+## 7. 结果评价与筛选准则
+
+### 7.1 必要条件
+
+1. 无硬失败（组分错误、冻结位点变化）；
+2. 在同一参数集内比较目标值。
+
+### 7.2 指标优先级
+
+1. `objective`（主排序）；
+2. `shell1_wMAE`（第一壳层优先）；
+3. `wRMSE`、`wMAE`；
+4. `P95`、`max_delta`（极值控制）。
+
+### 7.3 稳定性验证
+
+对多个 `seed` 重复计算，比较最优值与关键指标波动。
+
+---
+
+## 8. 推荐流程
+
+### 8.1 快速阶段
+
+- `triplet_weight = 0`
+- `search_mode = anneal`
+- 中等 `iterations`
+- 可暂时关闭 `enable_shape_optimization`
+
+### 8.2 精修阶段
+
+- `triplet_weight = 0.1~0.3`
+- 启用 `enable_shape_optimization`
+- 提升 `iterations` 与 `max_shape_candidates`
+
+### 8.3 报告阶段
+
+- 固定并记录全部参数；
+- 多种子重复验证；
+- 同时报告目标值与质量指标。
+
+---
+
+## 9. 与参考程序关系
+
+当 `triplet_weight = 0` 时，核心目标退化为纯二体 SQS 目标，与 sqsgenerator 的 pair-only 目标思想一致。  
+本程序属于独立实现，搜索路径与工程细节不保证逐步一致；数学目标与约束定义保持同类框架。
 

@@ -276,14 +276,24 @@ class MainWindow(QMainWindow):
                     pair_weights[si, bi, ai] = w
 
         mode_label = str(params["mode"]).lower()
-        iteration_mode = "systematic" if mode_label.startswith("systematic") else "random"
+        if mode_label.startswith("anneal"):
+            search_mode = "anneal"
+        elif mode_label.startswith("systematic"):
+            search_mode = "systematic"
+        else:
+            search_mode = "random"
         sublattices = [
             Sublattice(
                 sites=list(sl["sites"]),
                 composition=dict(sl["composition"]),
+                group_label=str(sl.get("group_label")) if sl.get("group_label") else None,
             )
             for sl in sublattices_raw
         ]
+
+        primitive = self._struct_panel.get_primitive()
+        sa, sb, sc = self._struct_panel.get_supercell_dims()
+        volume = int(sa) * int(sb) * int(sc)
 
         config = OptimizationConfig(
             structure=self._supercell,
@@ -296,8 +306,18 @@ class MainWindow(QMainWindow):
             keep=params["keep"],
             atol=params["atol"],
             rtol=params["rtol"],
-            iteration_mode=iteration_mode,
+            iteration_mode=search_mode,
             seed=params["seed"],
+            search_mode=search_mode,
+            anneal_start_temp=params["anneal_t0"],
+            anneal_end_temp=params["anneal_t1"],
+            triplet_weight=params["triplet_weight"],
+            enable_shape_optimization=bool(params["enable_shape_opt"]),
+            primitive_structure=primitive,
+            supercell_volume=volume,
+            supercell_dims=(sa, sb, sc),
+            max_shape_candidates=params["shape_candidates"],
+            num_threads=params["num_threads"],
         )
         self._last_config = config
 
@@ -360,51 +380,6 @@ class MainWindow(QMainWindow):
             f"Optimization complete: {len(results)} unique result(s), "
             f"best objective = {best:.6f}"
         )
-
-        # Recompute sublattice-aware SRO for display / quality grading
-        if self._last_config is not None and self._supercell is not None:
-            sublattice_sites = [sl.sites for sl in self._last_config.sublattices]
-            if sublattice_sites:
-                try:
-                    from core.sqs import recompute_sro_sublattice
-                    from core.structure import (
-                        build_pairs,
-                        build_shell_matrix,
-                        compute_prefactors_sublattice,
-                        distance_matrix,
-                    )
-                    import numpy as _np
-                    cfg = self._last_config
-                    dist = distance_matrix(self._supercell)
-                    shell_mat = build_shell_matrix(
-                        dist, results[0].shell_radii, cfg.atol, cfg.rtol,
-                    )
-                    all_pairs = build_pairs(shell_mat, cfg.shell_weights)
-                    # Filter pairs to sublattice-only bonds
-                    active_set: set = set()
-                    for sites in sublattice_sites:
-                        active_set.update(sites)
-                    if active_set and len(all_pairs) > 0:
-                        mask = _np.array(
-                            [(int(r[0]) in active_set and int(r[1]) in active_set)
-                             for r in all_pairs], dtype=bool,
-                        )
-                        sub_pairs = all_pairs[mask]
-                    else:
-                        sub_pairs = all_pairs
-                    _, prefactors = compute_prefactors_sublattice(
-                        shell_mat, cfg.shell_weights,
-                        results[0].species, sublattice_sites,
-                    )
-                    pre = {"pairs": sub_pairs, "prefactors": prefactors}
-                    for r in results:
-                        r.sro_sublattice = recompute_sro_sublattice(
-                            r, self._supercell, cfg.shell_weights,
-                            sublattice_sites, cfg.atol, cfg.rtol,
-                            precomputed=pre,
-                        )
-                except Exception:
-                    pass  # graceful fallback — keep sro_sublattice as None
 
         self._results_panel.display_results(results, self._supercell, self._last_config)
         self._tabs.setCurrentIndex(1)

@@ -154,16 +154,25 @@ class ResultsPanel(QWidget):
 
         self._result_list.clear()
         for i, r in enumerate(results):
+            quality_structure = r.structure if r.structure is not None else base_structure
+            quality_sublattices = (
+                r.sublattices if r.sublattices is not None else sublattices
+            )
             q = evaluate_sqs_quality(
                 r,
-                base_structure=base_structure,
-                sublattices=sublattices,
+                base_structure=quality_structure,
+                sublattices=quality_sublattices,
                 target=target,
                 shell_weights=shell_weights,
             )
             self._quality.append(q)
+            shape_tag = ""
+            if r.hnf_matrix is not None:
+                h = r.hnf_matrix.astype(int).ravel().tolist()
+                shape_tag = f"  HNF={h}"
             item = QListWidgetItem(
-                f"#{i+1}  {q.grade} {q.score:5.1f}  obj={r.objective:.6f}  (iter {r.iteration:,})"
+                f"#{i+1}  {q.grade} {q.score:5.1f}  obj={r.objective:.6f}  "
+                f"(iter {r.iteration:,}){shape_tag}"
             )
             self._result_list.addItem(item)
 
@@ -257,11 +266,12 @@ class ResultsPanel(QWidget):
         self._sro_table.resizeColumnsToContents()
 
     def _update_3d_view(self, result: SQSResult) -> None:
-        if self._base_structure is None:
+        base = result.structure if result.structure is not None else self._base_structure
+        if base is None:
             return
         # Build a structure with the result's species
         from core.structure import Structure
-        st = self._base_structure
+        st = base
         result_structure = Structure(
             lattice=st.lattice.copy(),
             frac_coords=st.frac_coords.copy(),
@@ -276,10 +286,18 @@ class ResultsPanel(QWidget):
     # ------------------------------------------------------------------
 
     def _get_result_structure(self) -> Optional[Structure]:
-        if self._current_result is None or self._base_structure is None:
+        if self._current_result is None:
             QMessageBox.warning(self, "No Result", "No result selected.")
             return None
-        st = self._base_structure
+        base = (
+            self._current_result.structure
+            if self._current_result.structure is not None
+            else self._base_structure
+        )
+        if base is None:
+            QMessageBox.warning(self, "No Structure", "No structure available for this result.")
+            return None
+        st = base
         return Structure(
             lattice=st.lattice.copy(),
             frac_coords=st.frac_coords.copy(),

@@ -8,6 +8,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFormLayout,
@@ -81,14 +82,52 @@ class ParamsPanel(QWidget):
         form.addRow("Keep best N:", self._keep_spin)
 
         self._mode_combo = QComboBox()
-        self._mode_combo.addItems(["Random (Monte Carlo)", "Systematic"])
-        form.addRow("Mode:", self._mode_combo)
+        self._mode_combo.addItems(
+            ["Anneal (ATAT-like)", "Random (Shuffle)", "Systematic"]
+        )
+        form.addRow("Search:", self._mode_combo)
 
         self._seed_spin = QSpinBox()
         self._seed_spin.setRange(-1, 2_147_483_647)
         self._seed_spin.setValue(-1)
         self._seed_spin.setSpecialValueText("Random")
         form.addRow("RNG seed:", self._seed_spin)
+
+        self._threads_spin = QSpinBox()
+        self._threads_spin.setRange(0, 256)
+        self._threads_spin.setValue(0)
+        self._threads_spin.setSpecialValueText("Auto")
+        form.addRow("CPU threads:", self._threads_spin)
+
+        self._anneal_t0_spin = QDoubleSpinBox()
+        self._anneal_t0_spin.setRange(1e-6, 1e3)
+        self._anneal_t0_spin.setDecimals(6)
+        self._anneal_t0_spin.setValue(0.2)
+        self._anneal_t0_spin.setSingleStep(0.01)
+        form.addRow("Anneal T0:", self._anneal_t0_spin)
+
+        self._anneal_t1_spin = QDoubleSpinBox()
+        self._anneal_t1_spin.setRange(1e-8, 1e2)
+        self._anneal_t1_spin.setDecimals(8)
+        self._anneal_t1_spin.setValue(0.001)
+        self._anneal_t1_spin.setSingleStep(0.0005)
+        form.addRow("Anneal Tend:", self._anneal_t1_spin)
+
+        self._triplet_weight_spin = QDoubleSpinBox()
+        self._triplet_weight_spin.setRange(0.0, 10.0)
+        self._triplet_weight_spin.setDecimals(4)
+        self._triplet_weight_spin.setValue(0.2)
+        self._triplet_weight_spin.setSingleStep(0.05)
+        form.addRow("Triplet weight:", self._triplet_weight_spin)
+
+        self._shape_opt_check = QCheckBox("Enable shape optimization")
+        self._shape_opt_check.setChecked(True)
+        form.addRow("", self._shape_opt_check)
+
+        self._shape_candidates_spin = QSpinBox()
+        self._shape_candidates_spin.setRange(1, 256)
+        self._shape_candidates_spin.setValue(24)
+        form.addRow("Shape candidates:", self._shape_candidates_spin)
 
         return gb
 
@@ -307,6 +346,12 @@ class ParamsPanel(QWidget):
             "atol": atol,
             "rtol": rtol,
             "shell_radii": list(self._shell_radii),
+            "anneal_t0": self._anneal_t0_spin.value(),
+            "anneal_t1": self._anneal_t1_spin.value(),
+            "triplet_weight": self._triplet_weight_spin.value(),
+            "enable_shape_opt": bool(self._shape_opt_check.isChecked()),
+            "shape_candidates": self._shape_candidates_spin.value(),
+            "num_threads": self._threads_spin.value(),
         }
 
     def get_shell_radii(self) -> List[float]:
